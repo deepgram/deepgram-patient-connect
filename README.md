@@ -104,13 +104,3 @@ client/
 patient_promotions_dataset.jsonl    # Sample patient records
 ```
 
-## Key Technical Details
-
-- **No framework overhead** — no Pipecat, no uvicorn, no FastAPI. The server is ~300 lines of Python using `websockets` and `asyncio.run()` directly.
-- **WAV header trick** — `deepgram-sagemaker` 0.2.1's v2/listen requires a WAV header prepended to the audio stream instead of passing `encoding`/`sample_rate` parameters.
-- **Factory swapping** — the Deepgram SDK only supports one transport factory per process. STT and TTS swap factories via `restore_transport()` between connections.
-- **Browser audio** — mic capture uses `ScriptProcessorNode` with manual downsampling from the device's native rate to 16kHz PCM16.
-
-## License
-
-MIT
