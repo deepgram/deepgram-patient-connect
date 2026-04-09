@@ -1,6 +1,6 @@
 # Deepgram SDK + SageMaker transport (STT + TTS)
 deepgram-sdk>=6.0.0
-deepgram-sagemaker==0.2.1
+deepgram-sagemaker>=0.2.2
 
 # Amazon Bedrock LLM
 boto3

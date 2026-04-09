@@ -1,7 +1,6 @@
 """Patient Connect voice agent server.
 
-Uses websockets + asyncio.run() directly (NOT uvicorn/FastAPI) because
-deepgram-sagemaker 0.2.1 v2/listen only works with asyncio.run().
+Uses websockets + asyncio.run() with deepgram-sagemaker >= 0.2.2.
 
 HTTP endpoints: /api/health, /api/records
 WebSocket:      /ws/call?record_id=...
@@ -16,7 +15,6 @@ import json
 import logging
 import os
 import re
-import struct
 import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -42,34 +40,29 @@ TTS_SAMPLE_RATE = config.DEEPGRAM_TTS_SAMPLE_RATE
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
-# ---------------------------------------------------------------------------
-# WAV header for STT (endpoint auto-detects format from header)
-# ---------------------------------------------------------------------------
+def _fresh_client(endpoint: str, region: str) -> AsyncDeepgramClient:
+    """Create a fresh AsyncDeepgramClient with restore_transport() first."""
+    try:
+        restore_transport()
+    except Exception:
+        pass
+    factory = SageMakerTransportFactory(endpoint_name=endpoint, region=region)
+    return AsyncDeepgramClient(api_key="unused", transport_factory=factory)
 
-def _wav_header(sr=16000):
-    br, ba = sr * 2, 2
-    return struct.pack("<4sI4s4sIHHIIHH4sI",
-        b"RIFF", 0x7FFFFFFF + 36, b"WAVE",
-        b"fmt ", 16, 1, 1, sr, br, ba, 16, b"data", 0x7FFFFFFF)
-
 
 # ---------------------------------------------------------------------------
-# TTS: open fresh connection per sentence (SageMaker closes idle streams)
+# TTS: open fresh connection per sentence
 # ---------------------------------------------------------------------------
 
 async def _synthesize(text: str) -> list[bytes]:
-    """Synthesize text via Aura-2 TTS on SageMaker. Returns PCM16 chunks."""
     logger.info("TTS: '%s' (%d chars)", text[:60], len(text))
     audio: list[bytes] = []
     flushed = asyncio.Event()
 
-    restore_transport()
-    tts_factory = SageMakerTransportFactory(
-        endpoint_name=config.SAGEMAKER_ENDPOINT_TTS, region=config.SAGEMAKER_TTS_REGION)
-    tts_client = AsyncDeepgramClient(api_key="unused", transport_factory=tts_factory)
+    client = _fresh_client(config.SAGEMAKER_ENDPOINT_TTS, config.SAGEMAKER_TTS_REGION)
 
     try:
-        async with tts_client.speak.v1.connect(
+        async with client.speak.v1.connect(
             model=config.DEEPGRAM_TTS_MODEL,
             encoding="linear16",
             sample_rate=str(TTS_SAMPLE_RATE),
@@ -99,14 +92,16 @@ async def _synthesize(text: str) -> list[bytes]:
             await asyncio.sleep(0.5)
             task.cancel()
     finally:
-        restore_transport()
+        try:
+            restore_transport()
+        except Exception:
+            pass
 
     logger.info("TTS: %d chunks (%d bytes)", len(audio), sum(len(c) for c in audio))
     return audio
 
 
 async def _speak(ws, text: str) -> None:
-    """Synthesize text and send audio + transcript to browser."""
     await ws.send(json.dumps({"type": "agent_transcript", "text": text}))
     for sentence in _SENTENCE_SPLIT.split(text):
         sentence = sentence.strip()
@@ -137,18 +132,19 @@ async def voice_agent(ws, record: dict[str, Any]) -> None:
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
     )
 
-    # -- Send greeting (TTS only, no LLM) ----------------------------------
+    # -- Send greeting (TTS only, no LLM) --
     logger.info("Greeting: %s", greeting[:60])
     await _speak(ws, greeting)
     messages.append({"role": "assistant", "content": [{"text": greeting}]})
 
-    # -- Open STT (AFTER greeting so TTS factory doesn't conflict) ----------
-    restore_transport()
-    stt_factory = SageMakerTransportFactory(
-        endpoint_name=config.SAGEMAKER_ENDPOINT_STT, region=config.SAGEMAKER_STT_REGION)
-    stt_client = AsyncDeepgramClient(api_key="unused", transport_factory=stt_factory)
+    # -- Open STT --
+    stt_client = _fresh_client(config.SAGEMAKER_ENDPOINT_STT, config.SAGEMAKER_STT_REGION)
 
-    async with stt_client.listen.v2.connect(model=config.DEEPGRAM_STT_MODEL) as stt_conn:
+    async with stt_client.listen.v2.connect(
+        model=config.DEEPGRAM_STT_MODEL,
+        encoding="linear16",
+        sample_rate=str(MIC_SAMPLE_RATE),
+    ) as stt_conn:
 
         stt_connected_logged = False
 
@@ -176,27 +172,20 @@ async def voice_agent(ws, record: dict[str, Any]) -> None:
         stt_conn.on(EventType.ERROR, on_stt_err)
         listen_task = asyncio.create_task(stt_conn.start_listening())
         await asyncio.sleep(0.5)
-        logger.info("STT: ready for audio")
+        logger.info("STT: ready")
 
-        # -- Audio receiver: browser → STT ----------------------------------
         running = True
-        wav_sent = False
 
         async def audio_receiver():
-            nonlocal running, wav_sent
+            nonlocal running
             try:
                 async for msg in ws:
                     if isinstance(msg, bytes) and len(msg) > 0:
-                        if not wav_sent:
-                            await stt_conn.send_media(_wav_header(MIC_SAMPLE_RATE) + msg)
-                            wav_sent = True
-                        else:
-                            await stt_conn.send_media(msg)
+                        await stt_conn.send_media(msg)
             except websockets.ConnectionClosed:
                 pass
             running = False
 
-        # -- Conversation loop: transcript → Bedrock → TTS → browser -------
         async def conversation_loop():
             while running:
                 try:
@@ -219,14 +208,12 @@ async def voice_agent(ws, record: dict[str, Any]) -> None:
                     reply = resp["output"]["message"]["content"][0]["text"]
                     messages.append({"role": "assistant", "content": [{"text": reply}]})
                     logger.info("Agent: %s", reply[:80])
-
-                    # TTS swaps factory, then restores — STT conn stays alive
                     await _speak(ws, reply)
 
-                    # Re-install STT factory for any future STT connections
+                    # Re-install STT factory after TTS swapped it
                     restore_transport()
-                    AsyncDeepgramClient(api_key="unused", transport_factory=stt_factory)
-
+                    AsyncDeepgramClient(api_key="unused", transport_factory=SageMakerTransportFactory(
+                        endpoint_name=config.SAGEMAKER_ENDPOINT_STT, region=config.SAGEMAKER_STT_REGION))
                 except Exception:
                     logger.exception("Conversation turn failed")
 
@@ -273,24 +260,24 @@ async def handle_ws(ws):
 
 
 async def mic_test_session(ws):
-    """Standalone mic test — browser audio → STT → transcripts back."""
     logger.info("Mic test started")
-    restore_transport()
-    factory = SageMakerTransportFactory(
-        endpoint_name=config.SAGEMAKER_ENDPOINT_STT, region=config.SAGEMAKER_STT_REGION)
-    client = AsyncDeepgramClient(api_key="unused", transport_factory=factory)
+    client = _fresh_client(config.SAGEMAKER_ENDPOINT_STT, config.SAGEMAKER_STT_REGION)
 
-    async with client.listen.v2.connect(model=config.DEEPGRAM_STT_MODEL) as conn:
-        mic_connected_logged = False
+    async with client.listen.v2.connect(
+        model=config.DEEPGRAM_STT_MODEL,
+        encoding="linear16",
+        sample_rate=str(MIC_SAMPLE_RATE),
+    ) as conn:
+        mic_logged = False
 
         def on_msg(m):
-            nonlocal mic_connected_logged
+            nonlocal mic_logged
             transcript = getattr(m, "transcript", None)
             event = getattr(m, "event", None)
             if getattr(m, "request_id", None) and not transcript:
-                if not mic_connected_logged:
+                if not mic_logged:
                     logger.info("Mic test: STT connected")
-                    mic_connected_logged = True
+                    mic_logged = True
                 return
             if transcript:
                 is_final = "end" in str(event or "").lower()
@@ -302,15 +289,10 @@ async def mic_test_session(ws):
         task = asyncio.create_task(conn.start_listening())
         await asyncio.sleep(0.5)
 
-        hdr_sent = False
         try:
             async for msg in ws:
                 if isinstance(msg, bytes) and len(msg) > 0:
-                    if not hdr_sent:
-                        await conn.send_media(_wav_header() + msg)
-                        hdr_sent = True
-                    else:
-                        await conn.send_media(msg)
+                    await conn.send_media(msg)
         except websockets.ConnectionClosed:
             pass
         await conn.send_close_stream()
@@ -320,7 +302,7 @@ async def mic_test_session(ws):
 
 
 # ---------------------------------------------------------------------------
-# HTTP request handler (REST API + debug pages)
+# HTTP handler
 # ---------------------------------------------------------------------------
 
 MIC_TEST_HTML = """<!DOCTYPE html><html><head><title>Mic Test</title>
@@ -353,38 +335,25 @@ function stopMic(){if(proc)proc.disconnect();if(strm)strm.getTracks().forEach(t=
 
 
 async def process_request(connection, request):
-    """Handle HTTP requests (REST API + HTML pages). Return None for WebSocket upgrade."""
     path = urlparse(request.path).path
-
     if path.startswith("/ws/"):
         return None
-
     if path == "/api/health":
         return connection.respond(http.HTTPStatus.OK, json.dumps({"status": "ok"}))
-
     if path == "/api/records":
         try:
             rows = load_eligible_records()
             return connection.respond(http.HTTPStatus.OK, json.dumps(rows))
         except FileNotFoundError as e:
-            return connection.respond(
-                http.HTTPStatus.INTERNAL_SERVER_ERROR,
-                json.dumps({"detail": str(e)}))
-
+            return connection.respond(http.HTTPStatus.INTERNAL_SERVER_ERROR, json.dumps({"detail": str(e)}))
     if path == "/api/start":
         return connection.respond(http.HTTPStatus.OK, json.dumps({"status": "ok"}))
-
     if path == "/mic-test":
         resp = connection.respond(http.HTTPStatus.OK, MIC_TEST_HTML)
         resp.headers["Content-Type"] = "text/html; charset=utf-8"
         return resp
-
     return connection.respond(http.HTTPStatus.NOT_FOUND, "Not found")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 async def main():
     logger.info("Patient Connect server on port %d", PORT)
@@ -394,15 +363,8 @@ async def main():
     logger.info("Mic test: http://localhost:%d/mic-test", PORT)
     logger.info("Client:   http://localhost:5173")
 
-    async with websockets.serve(
-        handle_ws,
-        "0.0.0.0",
-        PORT,
-        process_request=process_request,
-        max_size=2**20,
-    ):
+    async with websockets.serve(handle_ws, "0.0.0.0", PORT, process_request=process_request, max_size=2**20):
         await asyncio.Future()
-
 
 if __name__ == "__main__":
     try:
