@@ -13,14 +13,23 @@ export interface PatientRecord {
   clinical: {
     primary_condition: string
     icd10_code: string
-    current_medication: string
+    current_medication: {
+      name: string
+      drug_class: string
+      known_issues: string
+      monthly_cost: number
+    }
     prescriber: string
     pharmacy: string
   }
   promotion: {
     drug_name: string
+    drug_class: string
     manufacturer: string
     promotion_type: string
+    how_it_works: string
+    advantages_over_current: string[]
+    potential_downsides: string[]
     benefit_description: string
     max_annual_benefit_usd: number
     eligibility_criteria: string
@@ -34,7 +43,7 @@ export interface PatientRecord {
     scenario_label: string
     expected_outcome: string
     agent_notes: string
-    is_edge_case: boolean
+    is_edge_case?: boolean
   }
 }
 

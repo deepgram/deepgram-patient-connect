@@ -21,8 +21,9 @@ sagemaker-deploy/
 instructions.md
 sample-conversations.md
 
-# Vite cache
+# Vite cache / old web folder
 .vite/
+web/
 
 # IDE
 .vscode/

@@ -41,7 +41,7 @@ DEEPGRAM_TTS_SAMPLE_RATE = int(_get("DEEPGRAM_TTS_SAMPLE_RATE", "24000") or "240
 DEEPGRAM_API_KEY = _get("DEEPGRAM_API_KEY", "")
 
 # Amazon Bedrock LLM
-BEDROCK_MODEL_ID = _get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+BEDROCK_MODEL_ID = _get("BEDROCK_MODEL_ID", "us.amazon.nova-micro-v1:0")
 
 DATASET_PATH = _get(
     "DATASET_PATH",

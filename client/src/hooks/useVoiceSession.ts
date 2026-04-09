@@ -48,6 +48,12 @@ export function useVoiceSession() {
   const nextPlayTimeRef = useRef(0);
 
   const cleanup = useCallback(() => {
+    if (flushTimerRef.current) {
+      clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+    audioBufRef.current = [];
+
     processorRef.current?.disconnect();
     processorRef.current = null;
 
@@ -70,18 +76,31 @@ export function useVoiceSession() {
     return () => cleanup();
   }, [cleanup]);
 
-  const playAudioChunk = useCallback((pcm16: ArrayBuffer) => {
+  const audioBufRef = useRef<Int16Array[]>([]);
+  const audioBufSamplesRef = useRef(0);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const MIN_SAMPLES = SPEAKER_SAMPLE_RATE / 4; // 250ms = 6000 samples at 24kHz
+
+  const flushAudioBuffer = useCallback(() => {
+    flushTimerRef.current = null;
     const ctx = playCtxRef.current;
-    if (!ctx) return;
+    const chunks = audioBufRef.current;
+    if (!ctx || chunks.length === 0) return;
 
-    const int16 = new Int16Array(pcm16);
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-      float32[i] = int16[i] / 32768;
+    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+    const merged = new Float32Array(totalLen);
+    let offset = 0;
+    for (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i++) {
+        merged[offset++] = chunk[i] / 32768;
+      }
     }
+    audioBufRef.current = [];
+    audioBufSamplesRef.current = 0;
 
-    const buffer = ctx.createBuffer(1, float32.length, SPEAKER_SAMPLE_RATE);
-    buffer.getChannelData(0).set(float32);
+    const buffer = ctx.createBuffer(1, merged.length, SPEAKER_SAMPLE_RATE);
+    buffer.getChannelData(0).set(merged);
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
@@ -89,11 +108,27 @@ export function useVoiceSession() {
 
     const now = ctx.currentTime;
     if (nextPlayTimeRef.current < now) {
-      nextPlayTimeRef.current = now + 0.05;
+      nextPlayTimeRef.current = now + 0.02;
     }
     source.start(nextPlayTimeRef.current);
     nextPlayTimeRef.current += buffer.duration;
   }, []);
+
+  const playAudioChunk = useCallback((pcm16: ArrayBuffer) => {
+    if (!playCtxRef.current) return;
+    const samples = new Int16Array(pcm16);
+    audioBufRef.current.push(samples);
+    audioBufSamplesRef.current += samples.length;
+
+    // Flush when we have 250ms+ of audio (avoids splitting words)
+    if (audioBufSamplesRef.current >= MIN_SAMPLES) {
+      if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+      flushAudioBuffer();
+    } else if (!flushTimerRef.current) {
+      // Safety flush after 500ms if we don't reach the threshold (end of sentence)
+      flushTimerRef.current = setTimeout(() => flushAudioBuffer(), 500);
+    }
+  }, [flushAudioBuffer]);
 
   const disconnect = useCallback(() => {
     cleanup();
@@ -172,11 +207,28 @@ export function useVoiceSession() {
             console.log("[voice] message:", event.data);
             try {
               const msg = JSON.parse(event.data);
-              if (msg.type === "agent_transcript") {
-                setMessages((prev) => [
-                  ...prev,
-                  { role: "agent", text: msg.text },
-                ]);
+              if (msg.type === "agent_interrupted") {
+                // Barge-in: discard pending audio and reset playback
+                audioBufRef.current = [];
+                if (flushTimerRef.current) {
+                  clearTimeout(flushTimerRef.current);
+                  flushTimerRef.current = null;
+                }
+                const ctx = playCtxRef.current;
+                if (ctx) {
+                  ctx.close().catch(() => {});
+                  const newCtx = new AudioContext({ sampleRate: SPEAKER_SAMPLE_RATE });
+                  playCtxRef.current = newCtx;
+                  nextPlayTimeRef.current = 0;
+                }
+              } else if (msg.type === "agent_transcript") {
+                setMessages((prev) => {
+                  // Update last agent bubble if it exists (streaming accumulates)
+                  if (prev.length > 0 && prev[prev.length - 1].role === "agent") {
+                    return [...prev.slice(0, -1), { role: "agent", text: msg.text }];
+                  }
+                  return [...prev, { role: "agent", text: msg.text }];
+                });
               } else if (msg.type === "user_transcript") {
                 setMessages((prev) => [
                   ...prev,

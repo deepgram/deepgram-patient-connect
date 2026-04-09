@@ -51,68 +51,180 @@ def _fresh_client(endpoint: str, region: str) -> AsyncDeepgramClient:
 
 
 # ---------------------------------------------------------------------------
-# TTS: open fresh connection per sentence
+# TTS: one factory swap per response, stream audio as it arrives
 # ---------------------------------------------------------------------------
 
-async def _synthesize(text: str) -> list[bytes]:
-    logger.info("TTS: '%s' (%d chars)", text[:60], len(text))
-    audio: list[bytes] = []
-    flushed = asyncio.Event()
+async def _speak(ws, text: str) -> None:
+    """Synthesize all sentences with a single factory swap. Streams audio."""
+    await ws.send(json.dumps({"type": "agent_transcript", "text": text}))
 
-    client = _fresh_client(config.SAGEMAKER_ENDPOINT_TTS, config.SAGEMAKER_TTS_REGION)
+    tts_client = _fresh_client(config.SAGEMAKER_ENDPOINT_TTS, config.SAGEMAKER_TTS_REGION)
 
     try:
-        async with client.speak.v1.connect(
-            model=config.DEEPGRAM_TTS_MODEL,
-            encoding="linear16",
-            sample_rate=str(TTS_SAMPLE_RATE),
-        ) as conn:
-            def on_msg(d):
-                if isinstance(d, (bytes, bytearray)):
-                    audio.append(bytes(d))
-                elif isinstance(d, SpeakV1Flushed):
-                    flushed.set()
-
-            def on_err(e):
-                if "STREAM_BROKEN" not in repr(e):
-                    logger.error("TTS error: %s", e)
-
-            conn.on(EventType.MESSAGE, on_msg)
-            conn.on(EventType.ERROR, on_err)
-            task = asyncio.create_task(conn.start_listening())
-            await asyncio.sleep(0.5)
-            await conn.send_text(SpeakV1Text(type="Speak", text=text))
-            await conn.send_flush(SpeakV1Flush(type="Flush"))
+        for sentence in _SENTENCE_SPLIT.split(text):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
             try:
-                await asyncio.wait_for(flushed.wait(), timeout=15.0)
-            except asyncio.TimeoutError:
-                logger.warning("TTS: flushed timeout")
-            await asyncio.sleep(0.3)
-            await conn.send_close(SpeakV1Close(type="Close"))
-            await asyncio.sleep(0.5)
-            task.cancel()
+                await _synthesize_and_stream(ws, tts_client, sentence)
+            except Exception:
+                logger.exception("TTS failed: %s", sentence[:60])
     finally:
         try:
             restore_transport()
         except Exception:
             pass
 
-    logger.info("TTS: %d chunks (%d bytes)", len(audio), sum(len(c) for c in audio))
-    return audio
+
+def _clean_for_tts(text: str) -> str:
+    """Clean text for TTS — remove characters that cause mispronunciation."""
+    text = text.replace("—", ", ").replace("–", ", ").replace("…", "...")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-async def _speak(ws, text: str) -> None:
-    await ws.send(json.dumps({"type": "agent_transcript", "text": text}))
-    for sentence in _SENTENCE_SPLIT.split(text):
-        sentence = sentence.strip()
-        if not sentence:
-            continue
+async def _synthesize_and_stream(ws, client: AsyncDeepgramClient, text: str) -> None:
+    """Synthesize one sentence and stream audio to browser as chunks arrive."""
+    text = _clean_for_tts(text)
+    logger.info("TTS: '%s' (%d chars)", text[:60], len(text))
+    audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    flushed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    total_bytes = 0
+
+    async with client.speak.v1.connect(
+        model=config.DEEPGRAM_TTS_MODEL,
+        encoding="linear16",
+        sample_rate=str(TTS_SAMPLE_RATE),
+    ) as conn:
+
+        def on_msg(d):
+            if isinstance(d, (bytes, bytearray)):
+                loop.call_soon_threadsafe(audio_queue.put_nowait, bytes(d))
+            elif isinstance(d, SpeakV1Flushed):
+                flushed.set()
+                loop.call_soon_threadsafe(audio_queue.put_nowait, None)
+
+        def on_err(e):
+            if "STREAM_BROKEN" not in repr(e):
+                logger.error("TTS error: %s", e)
+
+        conn.on(EventType.MESSAGE, on_msg)
+        conn.on(EventType.ERROR, on_err)
+        task = asyncio.create_task(conn.start_listening())
+        await asyncio.sleep(0.1)
+
+        await conn.send_text(SpeakV1Text(type="Speak", text=text))
+        await conn.send_flush(SpeakV1Flush(type="Flush"))
+
+        # Stream audio to browser as it arrives from TTS
+        while True:
+            try:
+                chunk = await asyncio.wait_for(audio_queue.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("TTS: stream timeout")
+                break
+            if chunk is None:
+                break
+            await ws.send(chunk)
+            total_bytes += len(chunk)
+
+        await conn.send_close(SpeakV1Close(type="Close"))
+        await asyncio.sleep(0.5)
+        task.cancel()
+
+    logger.info("TTS: streamed %d bytes", total_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Streaming Bedrock: TTS starts on first sentence while LLM still generates
+# ---------------------------------------------------------------------------
+
+_SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
+
+async def _stream_bedrock_and_speak(ws, bedrock, messages, system, interrupted: asyncio.Event | None = None) -> None:
+    """Stream Bedrock response sentence-by-sentence, TTS each immediately."""
+
+    sentence_buf = ""
+    full_reply = ""
+
+    def _stream_sync():
+        """Run in thread — yields text chunks from Bedrock converse_stream."""
+        resp = bedrock.converse_stream(
+            modelId=config.BEDROCK_MODEL_ID,
+            messages=messages,
+            system=[{"text": system}],
+            inferenceConfig={"maxTokens": 120, "temperature": 0.6},
+        )
+        for event in resp.get("stream", []):
+            if "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"].get("delta", {})
+                text = delta.get("text", "")
+                if text:
+                    yield text
+
+    # Collect chunks from streaming LLM in a thread
+    chunk_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _producer():
+        def _run():
+            for chunk in _stream_sync():
+                chunk_queue.put_nowait(chunk)
+            chunk_queue.put_nowait(None)
+        await asyncio.to_thread(_run)
+
+    producer_task = asyncio.create_task(_producer())
+
+    # Swap to TTS factory once for the entire response
+    tts_client = _fresh_client(config.SAGEMAKER_ENDPOINT_TTS, config.SAGEMAKER_TTS_REGION)
+    transcript_sent = False
+
+    try:
+        while True:
+            if interrupted and interrupted.is_set():
+                logger.info("Agent: interrupted by user")
+                break
+
+            chunk = await chunk_queue.get()
+            if chunk is None:
+                break
+
+            sentence_buf += chunk
+            full_reply += chunk
+
+            # Split at sentence boundaries (may produce multiple sentences per chunk)
+            while True:
+                match = _SENTENCE_END.search(sentence_buf)
+                if not match:
+                    break
+
+                split_pos = match.end()
+                sentence = sentence_buf[:split_pos].strip()
+                sentence_buf = sentence_buf[split_pos:]
+
+                if sentence:
+                    if interrupted and interrupted.is_set():
+                        logger.info("Agent: interrupted before TTS")
+                        break
+                    logger.info("Agent (streaming): %s", sentence[:60])
+                    await ws.send(json.dumps({"type": "agent_transcript", "text": full_reply.strip()}))
+                    await _synthesize_and_stream(ws, tts_client, sentence)
+
+        if sentence_buf.strip() and not (interrupted and interrupted.is_set()):
+            sentence = sentence_buf.strip()
+            logger.info("Agent (streaming): %s", sentence[:60])
+            await ws.send(json.dumps({"type": "agent_transcript", "text": full_reply.strip()}))
+            await _synthesize_and_stream(ws, tts_client, sentence)
+
+    finally:
         try:
-            chunks = await _synthesize(sentence)
-            for chunk in chunks:
-                await ws.send(chunk)
+            restore_transport()
         except Exception:
-            logger.exception("TTS failed: %s", sentence[:60])
+            pass
+        await producer_task
+
+    messages.append({"role": "assistant", "content": [{"text": full_reply}]})
+    logger.info("Agent full reply: %s", full_reply[:100])
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +287,8 @@ async def voice_agent(ws, record: dict[str, Any]) -> None:
         logger.info("STT: ready")
 
         running = True
+        interrupted = asyncio.Event()
+        agent_speaking = False
 
         async def audio_receiver():
             nonlocal running
@@ -187,34 +301,30 @@ async def voice_agent(ws, record: dict[str, Any]) -> None:
             running = False
 
         async def conversation_loop():
+            nonlocal agent_speaking
             while running:
                 try:
                     text = await asyncio.wait_for(transcript_queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
 
+                # Barge-in: if agent is speaking, interrupt it
+                if agent_speaking:
+                    interrupted.set()
+                    logger.info("BARGE-IN: user interrupted agent")
+                    await ws.send(json.dumps({"type": "agent_interrupted"}))
+
                 await ws.send(json.dumps({"type": "user_transcript", "text": text}))
                 logger.info("User: %s", text)
 
                 messages.append({"role": "user", "content": [{"text": text}]})
                 try:
-                    resp = await asyncio.to_thread(
-                        bedrock.converse,
-                        modelId=config.BEDROCK_MODEL_ID,
-                        messages=messages,
-                        system=[{"text": system}],
-                        inferenceConfig={"maxTokens": 600, "temperature": 0.4},
-                    )
-                    reply = resp["output"]["message"]["content"][0]["text"]
-                    messages.append({"role": "assistant", "content": [{"text": reply}]})
-                    logger.info("Agent: %s", reply[:80])
-                    await _speak(ws, reply)
-
-                    # Re-install STT factory after TTS swapped it
-                    restore_transport()
-                    AsyncDeepgramClient(api_key="unused", transport_factory=SageMakerTransportFactory(
-                        endpoint_name=config.SAGEMAKER_ENDPOINT_STT, region=config.SAGEMAKER_STT_REGION))
+                    interrupted.clear()
+                    agent_speaking = True
+                    await _stream_bedrock_and_speak(ws, bedrock, messages, system, interrupted)
+                    agent_speaking = False
                 except Exception:
+                    agent_speaking = False
                     logger.exception("Conversation turn failed")
 
         recv_task = asyncio.create_task(audio_receiver())

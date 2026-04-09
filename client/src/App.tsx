@@ -50,7 +50,7 @@ export default function App() {
               Patient Connect
             </h1>
             <p className="text-xs text-dg-muted">
-              Voice outreach for eligible savings programs
+              AI-powered drug recommendation calls
             </p>
           </div>
         </div>
@@ -119,7 +119,7 @@ export default function App() {
         <span className="flex items-center gap-6">
           <span className="bg-gradient-to-r from-dg-gradient-start to-dg-gradient-end bg-clip-text text-transparent font-medium">Deepgram</span>
           <span>AWS</span>
-          <span>Patient Connect</span>
+          <span>SageMaker + Bedrock</span>
         </span>
       </footer>
     </div>
