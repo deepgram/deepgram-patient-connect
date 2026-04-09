@@ -1,0 +1,11 @@
+# Deepgram SDK + SageMaker transport (STT + TTS)
+deepgram-sdk>=6.0.0
+deepgram-sagemaker==0.2.1
+
+# Amazon Bedrock LLM
+boto3
+
+# Web server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-dotenv>=1.0.0

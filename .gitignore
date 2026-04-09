@@ -1,0 +1,41 @@
+# Secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+
+# Extra / test scripts (not for this repo)
+extra/
+test-endpoints/
+sagemaker-deploy/
+
+# Local docs
+instructions.md
+sample-conversations.md
+
+# Vite cache
+.vite/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (large)
+*.wav
+*.mp3
+
+# Plan docs (local only)
+Plan:*
