@@ -17,8 +17,8 @@ Browser Speaker (24kHz PCM) ◄── WebSocket ◄── Deepgram Aura-2 TTS (S
 
 | Component | Technology |
 |-----------|-----------|
-| **STT** | Deepgram Flux on SageMaker (`deepgram-sagemaker` 0.2.1) |
-| **TTS** | Deepgram Aura-2 on SageMaker (`deepgram-sagemaker` 0.2.1) |
+| **STT** | Deepgram Flux on SageMaker (`deepgram-sagemaker` 0.2.2) |
+| **TTS** | Deepgram Aura-2 on SageMaker (`deepgram-sagemaker` 0.2.2) |
 | **LLM** | Amazon Bedrock — Claude Haiku (Converse API) |
 | **Server** | Python `websockets` + `asyncio` |
 | **Client** | React + Vite + raw WebSocket + Web Audio API |
@@ -33,14 +33,20 @@ Browser Speaker (24kHz PCM) ◄── WebSocket ◄── Deepgram Aura-2 TTS (S
 
 ## Quick Start
 
-### 1. Configure environment
+### 1. Clone the repo
 
 ```bash
-cp server/.env.example server/.env
-# Edit server/.env with your AWS credentials and SageMaker endpoint names
+git clone <repo-url>
+cd Patient-Connect
 ```
 
-Or create `server/.env`:
+### 2. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your AWS credentials and endpoint names:
 
 ```env
 AWS_REGION=us-west-2
@@ -51,7 +57,7 @@ SAGEMAKER_ENDPOINT_NAME_TTS=your-tts-endpoint
 BEDROCK_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ```
 
-### 2. Start the server
+### 3. Start the server
 
 ```bash
 cd server
@@ -61,7 +67,11 @@ pip install -r requirements.txt
 python main.py
 ```
 
-### 3. Start the client
+The server runs on **http://localhost:8000**.
+
+### 4. Start the client
+
+In a new terminal:
 
 ```bash
 cd client
@@ -69,7 +79,7 @@ npm install
 npm run dev
 ```
 
-### 4. Open the app
+### 5. Open the app
 
 Go to **http://localhost:5173**, select a patient, click **Connect**, and start talking.
 
@@ -85,6 +95,9 @@ Go to **http://localhost:5173**, select a patient, click **Connect**, and start 
 ## Project Structure
 
 ```
+.env.example                        # Environment config template (copy to .env)
+patient_promotions_dataset.jsonl     # Sample patient records
+
 server/
   main.py           # WebSocket server — STT, TTS, LLM orchestration
   config.py         # Environment-based configuration
@@ -100,7 +113,5 @@ client/
     components/ConversationPanel.tsx # Live conversation display
     components/DataTable.tsx         # Patient record table
     components/DataBrowser.tsx       # Sidebar navigation
-
-patient_promotions_dataset.jsonl    # Sample patient records
 ```
 
