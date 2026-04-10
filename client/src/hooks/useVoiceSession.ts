@@ -132,6 +132,8 @@ export function useVoiceSession() {
 
   const disconnect = useCallback(() => {
     cleanup();
+    setMessages([]);
+    setLastError(null);
     setStatus("idle");
   }, [cleanup]);
 

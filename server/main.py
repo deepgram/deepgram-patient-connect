@@ -244,12 +244,7 @@ async def voice_agent(ws, record: dict[str, Any]) -> None:
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
     )
 
-    # -- Send greeting (TTS only, no LLM) --
-    logger.info("Greeting: %s", greeting[:60])
-    await _speak(ws, greeting)
-    messages.append({"role": "assistant", "content": [{"text": greeting}]})
-
-    # -- Open STT --
+    # -- Open STT first so mic audio is captured while greeting plays --
     stt_client = _fresh_client(config.SAGEMAKER_ENDPOINT_STT, config.SAGEMAKER_STT_REGION)
 
     async with stt_client.listen.v2.connect(
@@ -300,6 +295,14 @@ async def voice_agent(ws, record: dict[str, Any]) -> None:
                 pass
             running = False
 
+        # Start capturing mic audio immediately (while greeting plays)
+        recv_task = asyncio.create_task(audio_receiver())
+
+        # -- Now send greeting (TTS) — STT is already listening --
+        logger.info("Greeting: %s", greeting[:60])
+        await _speak(ws, greeting)
+        messages.append({"role": "assistant", "content": [{"text": greeting}]})
+
         async def conversation_loop():
             nonlocal agent_speaking
             while running:
@@ -327,7 +330,6 @@ async def voice_agent(ws, record: dict[str, Any]) -> None:
                     agent_speaking = False
                     logger.exception("Conversation turn failed")
 
-        recv_task = asyncio.create_task(audio_receiver())
         conv_task = asyncio.create_task(conversation_loop())
         await asyncio.gather(recv_task, conv_task, return_exceptions=True)
 
